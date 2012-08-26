@@ -8,3 +8,5 @@ be created with the specified full path.
 
 dir_copy takes a source directory, and recursively copies the content into
 the destination directory.
+
+tested in the 3.2.5 version of the Linux kernel

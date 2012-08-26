@@ -47,7 +47,6 @@ static int fillonedir(void * __buf, const char * name,
 	// Open files associated with d_entry
 	ff = filp_open(file_pathname, O_RDONLY, 0);
 	if (!IS_ERR(ff)) {
-		printk("After filp_open.\n");
 		filp_close(ff, NULL);
 		kfree((void*)file_pathname);
 		return 0;
@@ -64,7 +63,6 @@ asmlinkage long file_copy(const char *srcF, const char *destF)
 	mm_segment_t old;
 	struct file *sf, *df;
 
-	printk("file_copy is working\n");
 	old = get_fs();
 	set_fs(KERNEL_DS);
 
@@ -186,9 +184,7 @@ asmlinkage long dir_copy(const char *srcD, const char *destD)
 				s = concat(psiz, 3, src, name, "\0");
 				psiz = strlen(des) + strlen(name) + 1;
 				d = concat(psiz, 3, des, name, "\0");
-				printk("concats: %s %s\n", s, d);
 				file_copy(s, d);
-				printk("after file_copy\n");
 				kfree(s);
 				kfree(d);
 			}
