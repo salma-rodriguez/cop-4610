@@ -4,14 +4,12 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/dcache.h>
+#include <linux/limits.h>
 #include <linux/linkage.h>
 #include <linux/dnotify.h>
 #include <linux/prefetch.h>
 #include <asm/string.h>
 #include <linux/stat.h>
-
-#define BUFSIZE 1024
-#define MAX_INT 4294967295
 
 __cacheline_aligned_in_smp DEFINE_SPINLOCK(dcache_lock);
 
@@ -20,245 +18,185 @@ ssize_t (*write)(struct file *, const char *, size_t, loff_t *);
 
 #define myread(file)                                                            \
 if (file) {                                                                     \
-    if (file->f_mode & FMODE_READ) {                                            \
-        ret = locks_verify_area(FLOCK_VERIFY_READ, file->f_dentry->d_inode,     \
-                    file, file->f_pos, count);                                  \
-        if (!ret) {                                                             \
-            ssize_t (*read)(struct file *, char *, size_t, loff_t *);           \
-            ret = -EINVAL;                                                      \
-            if (file->f_op && (read = file->f_op->read) != NULL)                \
+if (file->f_mode & FMODE_READ) {                                            	\
+	ret = locks_verify_area(FLOCK_VERIFY_READ, file->f_dentry->d_inode,     \
+		file, file->f_pos, count);                                  	\
+	if (!ret) {                                                             \
+		ssize_t (*read)(struct file *, char *, size_t, loff_t *);       \
+           	ret = -EINVAL;                                                  \
+        if (file->f_op && (read = file->f_op->read) != NULL)                	\
                 ret = read(file, buf, count, &file->f_pos);                     \
         }                                                                       \
-    }                                                                           \
-    if (ret > 0)                                                                \
-        dnotify_parent(file->f_dentry, DN_ACCESS);                              \
-    fput(file);                                                                 \
+}                                                                           	\
+if (ret > 0)                                                                	\
+	dnotify_parent(file->f_dentry, DN_ACCESS);                              \
+	fput(file);                                                             \
 }
 
 asmlinkage long sys_mkdirat(int dfd, const char __user * pathname, umode_t mode);
 
-
-
-static int prepend(char **buffer, int *buflen, const char *str, int namelen) {\
-    *buflen -= namelen;
-    if (*buflen < 0)
-        return -ENAMETOOLONG;
-    *buffer -= namelen;
-    memcpy(*buffer, str, namelen);
-    return 0;
-}
-
-static int prepend_name(char **buffer, int *buflen, struct qstr *name) {
-    return prepend(buffer, buflen, name->name, name->len);
-}
-
-char *get_path(struct dentry *dentry, char *buf, int buflen)
+static int fillonedir(void * __buf, const char * name,
+	int namelen, loff_t offset, u64 ino, unsigned int d_type)
 {
-    char *end = buf + buflen;
-    char *retval;
+	struct file *ff;
+	char *file_pathname = kmalloc(strlen((char*)__buf) + strlen(name) + 2, GFP_KERNEL);
+	file_pathname = strcpy(file_pathname, (char*)__buf);
+	file_pathname = strcat(file_pathname, "/");
+	file_pathname = strcat(file_pathname, name);
 
-    spin_lock(&dcache_lock);
-    prepend(&end, &buflen, "\0", 1);
-    if (d_unlinked(dentry) && (prepend(&end, &buflen, "//deleted", 9) != 0))
-        goto Elong;
-    if (buflen < 1)
-        goto Elong;
-    // Get '/' right
-    retval = end-1;
-    *retval = '/';
-
-    while (!IS_ROOT(dentry)) {
-        struct dentry *parent = dentry->d_parent;
-
-        prefetch(parent);
-        if ((prepend_name(&end, &buflen, &dentry->d_name) != 0) ||
-                (prepend(&end, &buflen, "/", 1) != 0))
-                    goto Elong;
-
-        retval = end;
-        dentry = parent;
-    }
-    spin_unlock(&dcache_lock);
-    return retval;
-
-Elong:
-    spin_unlock(&dcache_lock);
-    return ERR_PTR(-ENAMETOOLONG);
+	// Open files associated with d_entry
+	ff = filp_open(file_pathname, O_RDONLY, 0);
+	if (!IS_ERR(ff)) {
+		printk("After filp_open.\n");
+		filp_close(ff, NULL);
+		kfree((void*)file_pathname);
+		return 0;
+	}
+	kfree((void*)file_pathname);
+	return -1;
 }
-
-static int fillonedir(void * __buf, const char *name,
-        int namelen, loff_t offset, u64 ino, unsigned int d_type)
-{
-    struct file *ff;
-    char *file_pathname = kmalloc(strlen((char*)__buf) + strlen(name) + 2, GFP_KERNEL);
-    file_pathname = strcpy(file_pathname, (char*)__buf);
-    file_pathname = strcat(file_pathname, "/");
-    file_pathname = strcat(file_pathname, name);
-
-    // Open files associated with d_entry
-    ff = filp_open(file_pathname, O_RDONLY, 0);
-    if (!IS_ERR(ff)) {
-        printk("After filp_open.\n");
-        filp_close(ff, NULL);
-        kfree((void*)file_pathname);
-        return 0;
-    }
-    kfree((void*)file_pathname);
-    return -1;
-}
-
-// typedef fillonedir_t int (*fillonedir);
 
 asmlinkage long file_copy(const char *srcF, const char *destF)
 {
-    printk("file_copy is working!\n");
-    printk("source: %s\n", srcF);
-    printk("destination: %s\n", destF);
+	char *buf;
+	int permflags;
+	ssize_t sz;
+	mm_segment_t old;
+	struct file *sf, *df;
 
-    char *buf;
-    ssize_t sz;
-    mm_segment_t old;
-    old = get_fs();
-    set_fs(KERNEL_DS);
-    struct file *sf, *df;
+	printk("file_copy is working\n");
+	old = get_fs();
+	set_fs(KERNEL_DS);
 
-    sf = filp_open(srcF, O_RDONLY | O_LARGEFILE, 0);
-    df = filp_open(destF, O_RDWR | O_CREAT | O_LARGEFILE, S_IRUSR | S_IWUSR | S_IROTH | S_IRGRP);
+	permflags = S_IRUSR | S_IWUSR | S_IROTH | S_IRGRP;
 
-    if(IS_ERR(sf) || IS_ERR(df))
-        return -EINVAL;
+	sf = filp_open(srcF, O_RDONLY | O_LARGEFILE, 0);
+	df = filp_open(destF, O_RDWR | O_CREAT | O_LARGEFILE, permflags);
 
-    printk("After filp_open inside file_copy sys call\n");
-    buf	= kmalloc(sizeof(char *) * 512UL, GFP_KERNEL);
-    printk("After kmalloc\n");
+	if (IS_ERR(sf)) {
+		printk(KERN_ERR "error opening source file\n");
+		return -EBADF;
+	}
 
-    do {
-        sz = vfs_read(sf, buf, 512UL, &sf->f_pos);
-        printk("After read: %lu\n", sz);
-        if (sz > 0) {
-            printk("%s\n", buf);
-            printk("bytes written: %lu\n", vfs_write(df, buf, sz, &df->f_pos));
-            printk("After write\n");
-        }
-    } while(sz > 0);
+	if (IS_ERR(df)) {
+		printk(KERN_ERR "error opening destination file\n");
+		return -EBADF;
+	}
 
-    // dnotify_parent(sf->f_dentry, DN_ACCESS);
+	buf = kmalloc(sizeof(char *) * 512UL, GFP_KERNEL);
 
-    printk("Before kfree\n");
-    kfree(buf);
-    printk("After kfree\n");
-    filp_close(sf, NULL);
-    filp_close(df, NULL);
-    printk("After filp_close\n");
-    set_fs(old);
-    return 0;
+	do {
+		sz = vfs_read(sf, buf, 512UL, &sf->f_pos);
+		if (!(sz|0)) break;
+		else if (sz < 0) {
+			printk(KERN_ERR "error reading from source file\n");
+			return -EIO;
+		} else {
+			if((sz = vfs_write(df, buf, sz, &df->f_pos)) < 0) {
+				printk(KERN_ERR "error writing to destination file\n");
+				return -EIO;
+			}
+		}
+	} while(1);
+
+	kfree(buf);
+	filp_close(sf, NULL);
+	filp_close(df, NULL);
+	set_fs(old);
+	return 0;
+}
+
+char* concat(int psiz, int numargs, ...) {
+	char *s, *cat;
+	va_list argp;
+	/* 
+	 * it's better to use zalloc
+	 * because we want an empty buffer
+	 * and concatenation won't work otherwise
+	 */
+	s = kzalloc(psiz, 0);
+	va_start(argp, numargs);
+	while(numargs--) {
+		cat = va_arg(argp, char *);
+		s = strcat(s, cat);
+	}
+	va_end(argp);
+	return s;
 }
 
 asmlinkage long dir_copy(const char *srcD, const char *destD)
 {
-    printk("dir_copy is working!\n");
-    char *pname;
-    char *src, *des;
-    char *d, *s, *f;
-    struct dentry *tmp;
-    mm_segment_t old;
-    struct file *sf, *df;
+	mm_segment_t old;
+	struct dentry *tmp;
+	int permflags, psiz;
+	struct file *sf, *df;
+	char *d,*s,*src,*des,*pname;
+
 	old = get_fs();
-    set_fs(KERNEL_DS);
+	set_fs(KERNEL_DS);
 
-    sf = filp_open(srcD, O_DIRECTORY | O_RDONLY | O_LARGEFILE, 0);
-    df = filp_open(destD, O_DIRECTORY | O_LARGEFILE, 0x777);
+	sf = filp_open(srcD, O_DIRECTORY | O_RDONLY | O_LARGEFILE, 0);
+	df = filp_open(destD, O_DIRECTORY | O_LARGEFILE, 0x777);
 
-    if(IS_ERR(sf) || IS_ERR(df))
-        return -EINVAL;
+	if (IS_ERR(sf)) {
+		printk(KERN_ERR "error opening source file\n");
+		return -EBADF;
+	}
 
-    printk("After filp_open %s\n",srcD);
+	if (IS_ERR(df)) {
+		printk(KERN_ERR "error opening destination file\n");
+		return -EBADF;
+	}
+	
+	sf->f_op->readdir(sf, (void *)srcD, &fillonedir);
 
-    sf->f_op->readdir(sf, srcD, fillonedir);
+	tmp = NULL;
+	pname = (char *)sf->f_dentry->d_name.name;
+	
+	psiz = strlen(srcD) + 1;
+	src = concat(psiz, 2, (char *)srcD, "\0");
+	
+	psiz = strlen(destD) + strlen(pname) + 2;
+	des = concat(psiz, 3, (char *)destD, pname, "/\0");
 
-    tmp = NULL; // = sf->f_path.dentry;
-    pname = sf->f_dentry->d_name.name;
+	permflags = S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
 
-    src = kmalloc(strlen(srcD) + 1, 0);
-    des = kmalloc(strlen(destD) + strlen(pname) + 2, 0);
+	sys_mkdirat(O_DIRECTORY, des, permflags);
+	tmp = dget(sf->f_dentry);
 
-    printk("After kmalloc src & des\n");
+	list_for_each_entry(tmp, &sf->f_dentry->d_subdirs, d_u.d_child)
+	{
+		if(!tmp->d_inode) /* entry null */ {
+			continue;
+		} else /* entry not null */ {
+			struct qstr *qstr = &tmp->d_name;
+			const char *name = qstr->name;
+			umode_t mode = tmp->d_inode->i_mode;
 
-    src = strcpy(src, srcD);
-    src = strcat(src, "\0");
-    des = strcpy(des, destD);
-    des = strcat(des, pname);
-    des = strcat(des, "/");
+			if (S_ISDIR(mode)) {
+				psiz = strlen(src) + strlen(name) + 2;
+				s = concat(psiz, 3, src, name, "/\0");
+				psiz = strlen(des) + 1;
+				d = concat(psiz, 2, des, "\0");
+				dir_copy(s, d);
+				kfree(s);
+				kfree(d);
+			} else /* it's a file */ {
+				psiz = strlen(src) + strlen(name) + 1;
+				s = concat(psiz, 3, src, name, "\0");
+				psiz = strlen(des) + strlen(name) + 1;
+				d = concat(psiz, 3, des, name, "\0");
+				printk("concats: %s %s\n", s, d);
+				file_copy(s, d);
+				printk("after file_copy\n");
+				kfree(s);
+				kfree(d);
+			}
+		}
 
-    /* if (S_IFMT & (sf->f_dentry->d_inode->i_mode) == S_IFDIR) {
-        des = strcat(des, pname);
-        des = strcat(des, "/");
-    } */
-
-    des = strcat(des, "\0");
-
-    sys_mkdirat(O_DIRECTORY, des, S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-    printk("after sys_mkdirat\n");
-
-
-    tmp = dget(sf->f_dentry);
-    printk("After dentry\n");
-
-    list_for_each_entry(tmp, &sf->f_dentry->d_subdirs, d_u.d_child)
-    {
-        printk("Inside list_for_each\n");
-        if(!tmp->d_inode) {
-            printk("ENTRY NULL!!!!!!!\n");
-            continue;
-        } else {
-            printk("ENTRY NOT NULL!!!!!!!\n");
-            struct qstr *qstr = &tmp->d_name;
-            const char *name = qstr->name;
-
-            printk("My name is: %s\n", name);
-
-            umode_t mode = tmp->d_inode->i_mode;
-            printk("mode value: %lu\n", mode);
-
-            // if ((S_IFMT & (i_mode))== S_IFDIR) {
-            if (S_ISDIR(mode)) {
-                printk("I am a directory! And my name is: %s\n", name);
-                s = kmalloc(strlen(src) + strlen(name) + 2, 0);
-                d = kmalloc(strlen(des) + strlen(name) + 2, 0);
-                s = strcpy(s, src);
-                s = strcat(s, name);
-                s = strcat(s, "/\0");
-                d = strcpy(d, des);
-                d = strcat(d, "\0");
-                dir_copy(s, d);
-                kfree(s);
-                kfree(d);
-            } else /* it's a file */ {
-                printk("I am a file! And my name is: %s\n", name);
-                s = kmalloc(strlen(src) + strlen(name) + 1, 0);
-                d = kmalloc(strlen(des) + strlen(name) + 1, 0);
-                s = strcpy(s, src);
-                s = strcat(s, name);
-                s = strcat(s, "\0");
-                d = strcpy(d, des);
-                d = strcat(d, name);
-                d = strcat(d, "\0");
-                file_copy(s, d);
-                kfree(s);
-                kfree(d);
-            }
-        }
-
-        /* switch(S_IFMT & tmp->d_inode->i_mode) {
-            case (S_IFDIR) :
-                printk("I am a directory!\n");
-                // qstr = &tmp->d_name;
-                // printk("the name of my d_entry is: %s\n", qstr->name);
-                break;
-        } */
-    }
-    kfree(src);
-    kfree(des);
-    set_fs(old);
-    return 0;
+	}
+	kfree(src);
+	kfree(des);
+	set_fs(old);
+	return 0;
 }
